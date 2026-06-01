@@ -1,0 +1,597 @@
+package com.jumpmaster.app.core
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color as AndroidColor
+import android.graphics.Paint
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import java.io.File
+import java.io.FileOutputStream
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.util.Log
+import com.jumpmaster.app.core.adb.AdbConnectionService
+import com.jumpmaster.app.service.FloatingWindowService
+import com.jumpmaster.app.service.ScreenCaptureService
+import com.jumpmaster.app.service.TouchAccessibilityService
+import kotlinx.coroutines.*
+import kotlin.random.Random
+
+/**
+ * Main controller that orchestrates the jump flow:
+ * capture → analyze → calculate → press → wait → repeat
+ *
+ * Supports two backends:
+ * - LOCAL: MediaProjection + AccessibilityService (on-device)
+ * - ADB: Wireless ADB debugging (remote device or self-control)
+ */
+class JumpController(private val context: Context) {
+
+    companion object {
+        private const val TAG = "JumpController"
+    }
+
+    enum class Status {
+        IDLE, CAPTURE, DETECT, JUMP, CONNECTING, PAUSED, RESTING
+    }
+
+    interface Listener {
+        fun onStatusChanged(status: Status)
+        fun onJumpCompleted(count: Int, result: ImageAnalyzer.AnalysisResult?)
+        fun onError(message: String)
+    }
+
+    var config: DeviceConfig = DeviceConfig.forScreen(1080, 1920)
+        set(value) {
+            field = value
+            imageAnalyzer.updateConfig(value)
+        }
+
+    var listener: Listener? = null
+
+    private val imageAnalyzer = ImageAnalyzer(config)
+    private val handler = Handler(Looper.getMainLooper())
+    private val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
+    private var running = false
+    private var paused = false
+    private var jumpCount = 0
+    private var jumpsSinceRest = 0
+    private var nextRestAfter = Random.nextInt(3, 10)
+    private var nextRestSeconds = Random.nextInt(5, 10)
+    private var lastResult: ImageAnalyzer.AnalysisResult? = null
+    private var lastScreenshot: Bitmap? = null
+
+    fun isRunning(): Boolean = running
+    fun isPaused(): Boolean = paused
+
+    /**
+     * Start the auto-jump loop.
+     */
+    fun start() {
+        if (running) return
+
+        paused = false
+        when (config.captureMode) {
+            CaptureMode.LOCAL -> startLocalMode()
+            CaptureMode.ADB -> startAdbMode()
+        }
+    }
+
+    fun pause() {
+        if (!running || paused) return
+        paused = true
+        updateFloatingStatus("paused")
+        addLog("已暂停")
+        setStatus(Status.PAUSED)
+    }
+
+    fun resume() {
+        if (!running || !paused) return
+        paused = false
+        updateFloatingStatus("running")
+        addLog("继续运行")
+        when (config.captureMode) {
+            CaptureMode.LOCAL -> executeLocalJumpCycle()
+            CaptureMode.ADB -> executeAdbJumpCycle()
+        }
+    }
+
+    /**
+     * Stop the auto-jump loop.
+     */
+    fun stop() {
+        running = false
+        paused = false
+        updateFloatingStatus("idle")
+        addLog("已停止")
+        handler.removeCallbacksAndMessages(null)
+        scope.coroutineContext.cancelChildren()
+    }
+
+    fun getJumpCount(): Int = jumpCount
+    fun getLastResult(): ImageAnalyzer.AnalysisResult? = lastResult
+    fun getLastScreenshot(): Bitmap? = lastScreenshot
+
+    // ── LOCAL mode (MediaProjection + AccessibilityService) ──
+
+    private fun startLocalMode() {
+        if (!ScreenCaptureService.isRunning()) {
+            listener?.onError("截屏服务未启动")
+            return
+        }
+        if (!TouchAccessibilityService.isRunning()) {
+            listener?.onError("无障碍服务未启用，请在系统设置中开启")
+            return
+        }
+
+        running = true
+        paused = false
+        jumpCount = 0
+        resetRestPlan()
+        updateFloatingStatus("running")
+        addLog("本地模式启动")
+        executeLocalJumpCycle()
+    }
+
+    private fun executeLocalJumpCycle() {
+        if (!running || paused) return
+
+        setStatus(Status.CAPTURE)
+        updateFloatingStatus("capture")
+        addLog("截屏中")
+        setFloatingVisible(false)
+
+        handler.postDelayed({
+            if (!running || paused) {
+                setFloatingVisible(true)
+                return@postDelayed
+            }
+            // NOTE: Removed foreground check that relied on AccessibilityEvent
+            // because AccessibilityEvent only fires on window/focus changes,
+            // causing false "please switch to game" prompts after the first jump.
+            // The user is already in the game when they start the controller.
+            TouchAccessibilityService.captureScreenshot { accessibilityScreenshot ->
+                val screenshot = accessibilityScreenshot ?: ScreenCaptureService.captureScreen()
+                setFloatingVisible(true)
+
+                if (!running || paused) return@captureScreenshot
+
+                if (screenshot == null) {
+                    Log.w(TAG, "Failed to capture screenshot")
+                    addLog("截屏失败")
+                    scheduleNextRetry()
+                    return@captureScreenshot
+                }
+
+                if (accessibilityScreenshot != null) {
+                    addLog("无障碍截图 ${screenshot.width}x${screenshot.height}")
+                } else {
+                    addLog("投屏截图 ${screenshot.width}x${screenshot.height}")
+                }
+
+                setStatus(Status.DETECT)
+                updateFloatingStatus("detect")
+                addLog("识别中")
+
+                handler.post { analyzeAndJumpLocal(screenshot) }
+            }
+        }, 200)
+    }
+
+    private fun analyzeAndJumpLocal(screenshot: Bitmap) {
+        if (!running || paused) return
+        Log.d(TAG, "Analyzing screenshot: ${screenshot.width}x${screenshot.height}")
+        lastScreenshot = screenshot
+
+        // Always save debug screenshot on first attempt
+        if (jumpCount == 0 && lastResult == null) {
+            saveDebugScreenshot(screenshot, null)
+        }
+
+        val result = imageAnalyzer.analyze(screenshot)
+        if (result == null) {
+            Log.w(TAG, "Analysis failed - piece/board not found in ${screenshot.width}x${screenshot.height} bitmap")
+            listener?.onError("识别失败")
+            addLog("识别失败")
+            scheduleNextRetry()
+            return
+        }
+
+        lastResult = result
+        lastScreenshot = screenshot
+
+        // Save annotated debug screenshot
+        saveDebugScreenshot(screenshot, result)
+
+        setStatus(Status.JUMP)
+        updateFloatingStatus("jump")
+        addLog("距离 ${result.distance.toInt()}px · ${result.pressTimeMs}ms")
+        vibrate()
+
+        val pressX = config.startX.coerceIn(1, config.screenWidth - 1)
+        val pressY = config.startY.coerceIn(1, config.screenHeight - 1)
+
+        TouchAccessibilityService.longPress(pressX, pressY, result.pressTimeMs) { success ->
+            if (!running) return@longPress
+            if (success) {
+                jumpCount++
+                jumpsSinceRest++
+                handler.post {
+                    updateFloatingMetrics(jumpCount, result.pressTimeMs, result.distance, 0)
+                    listener?.onJumpCompleted(jumpCount, result)
+                }
+            }
+            scheduleNextLocalCycle()
+        }
+    }
+
+    private fun scheduleNextRetry() {
+        handler.postDelayed({
+            if (running && !paused) executeLocalJumpCycle()
+        }, 1000)
+    }
+
+    private fun scheduleNextLocalCycle() {
+        if (scheduleRestIfNeeded { executeLocalJumpCycle() }) return
+
+        val baseDelay = config.jumpDelay
+        val jitter = Random.nextLong(-200, 300)
+        val delay = (baseDelay + jitter).coerceAtLeast(800)
+        updateFloatingMetrics(jumpCount, lastResult?.pressTimeMs ?: 0L, lastResult?.distance ?: 0f, delay)
+
+        handler.postDelayed({
+            if (running && !paused) {
+                setStatus(Status.IDLE)
+                executeLocalJumpCycle()
+            }
+        }, delay)
+    }
+
+    // ── ADB mode (wireless debugging) ──
+
+    private fun startAdbMode() {
+        val adbService = AdbConnectionService.getInstance()
+
+        if (!adbService.isConnected()) {
+            // Connect first
+            if (config.adbHost.isBlank() || config.adbPort == 0) {
+                listener?.onError("请先在设置中配置ADB连接信息")
+                return
+            }
+
+            setStatus(Status.CONNECTING)
+            updateFloatingStatus("connecting")
+
+            adbService.listener = object : AdbConnectionService.ConnectionListener {
+                override fun onStateChanged(state: AdbConnectionService.ConnectionState) {
+                    when (state) {
+                        AdbConnectionService.ConnectionState.CONNECTED -> {
+                            running = true
+                            paused = false
+                            jumpCount = 0
+                            resetRestPlan()
+                            updateFloatingStatus("running")
+                            addLog("ADB连接成功")
+                            executeAdbJumpCycle()
+                        }
+                        AdbConnectionService.ConnectionState.ERROR -> {
+                            listener?.onError("ADB连接失败")
+                            addLog("ADB连接失败")
+                        }
+                        else -> {}
+                    }
+                }
+
+                override fun onError(message: String) {
+                    listener?.onError(message)
+                }
+            }
+
+            adbService.connect(
+                host = config.adbHost,
+                port = config.adbPort,
+                pairingCode = config.adbPairingCode.takeIf { it.isNotBlank() },
+                pairingPort = config.adbPairingPort.takeIf { it > 0 }
+            )
+        } else {
+            running = true
+            paused = false
+            jumpCount = 0
+            resetRestPlan()
+            updateFloatingStatus("running")
+            addLog("复用ADB连接")
+            executeAdbJumpCycle()
+        }
+    }
+
+    private fun executeAdbJumpCycle() {
+        if (!running || paused) return
+
+        setStatus(Status.CAPTURE)
+        updateFloatingStatus("capture")
+        addLog("截屏中")
+
+        scope.launch {
+            val adbService = AdbConnectionService.getInstance()
+            if (!adbService.ensureConnected(
+                    host = config.adbHost,
+                    port = config.adbPort,
+                    pairingCode = config.adbPairingCode.takeIf { it.isNotBlank() },
+                    pairingPort = config.adbPairingPort.takeIf { it > 0 }
+                )
+            ) {
+                withContext(Dispatchers.Main) {
+                    listener?.onError("ADB连接已断开")
+                    running = false
+                    addLog("ADB连接断开")
+                }
+                return@launch
+            }
+            adbService.getScreenDensity()?.let { density ->
+                val adbHeadDiameter = density / 8f
+                if (adbHeadDiameter > 0f && kotlin.math.abs(config.headDiameter - adbHeadDiameter) > 0.1f) {
+                    config = config.copy(headDiameter = adbHeadDiameter)
+                    Log.i(TAG, "ADB calibrated headDiameter=$adbHeadDiameter from wm density=$density")
+                }
+            }
+
+            // Step 1: Screenshot via ADB
+            withContext(Dispatchers.Main) { setFloatingVisible(false) }
+            delay(250)
+            val screenshot = adbService.captureScreen()
+            withContext(Dispatchers.Main) { setFloatingVisible(true) }
+            if (!running || paused) return@launch
+            if (screenshot == null) {
+                Log.w(TAG, "ADB screenshot failed")
+                addLog("ADB截屏失败")
+                delay(1000)
+                if (running && !paused) executeAdbJumpCycle()
+                return@launch
+            }
+            saveDebugScreenshot(screenshot, null)
+
+            setStatus(Status.DETECT)
+            updateFloatingStatus("detect")
+            addLog("识别中")
+
+            // Step 2: Analyze
+            val result = imageAnalyzer.analyze(screenshot)
+            if (!running || paused) return@launch
+            if (result == null) {
+                Log.w(TAG, "ADB analysis failed")
+                listener?.onError("识别失败")
+                addLog("识别失败")
+                delay(1000)
+                if (running && !paused) executeAdbJumpCycle()
+                return@launch
+            }
+
+            withContext(Dispatchers.Main) {
+                lastResult = result
+                lastScreenshot = screenshot
+            }
+
+            setStatus(Status.JUMP)
+            updateFloatingStatus("jump")
+            addLog("距离 ${result.distance.toInt()}px · ${result.pressTimeMs}ms")
+            withContext(Dispatchers.Main) { vibrate() }
+            saveDebugScreenshot(screenshot, result)
+            if (!running || paused) return@launch
+
+            // Step 3: Touch via ADB (input swipe)
+            val press = createOriginalSwipePosition(screenshot.width, screenshot.height)
+            Log.i(
+                TAG,
+                "ADB long press from (${press.first.first}, ${press.first.second}) " +
+                        "to (${press.second.first}, ${press.second.second}) for ${result.pressTimeMs}ms"
+            )
+            val success = adbService.performLongPress(
+                x = press.first.first,
+                y = press.first.second,
+                endX = press.second.first,
+                endY = press.second.second,
+                durationMs = result.pressTimeMs
+            )
+
+            if (success) {
+                jumpsSinceRest++
+                withContext(Dispatchers.Main) {
+                    jumpCount++
+                    updateFloatingMetrics(jumpCount, result.pressTimeMs, result.distance, 0)
+                    listener?.onJumpCompleted(jumpCount, result)
+                }
+            }
+
+            // Step 4: Wait
+            if (restIfNeededSuspend()) {
+                if (running && !paused) {
+                    withContext(Dispatchers.Main) { setStatus(Status.IDLE) }
+                    executeAdbJumpCycle()
+                }
+                return@launch
+            }
+            val baseDelay = config.jumpDelay
+            val jitter = Random.nextLong(-200, 300)
+            val delayMs = (baseDelay + jitter).coerceAtLeast(800)
+            updateFloatingMetrics(jumpCount, result.pressTimeMs, result.distance, delayMs)
+
+            delay(delayMs)
+            if (running && !paused) {
+                withContext(Dispatchers.Main) { setStatus(Status.IDLE) }
+                executeAdbJumpCycle()
+            }
+        }
+    }
+
+    // ── Shared helpers ──
+
+    /**
+     * Save a debug screenshot to /sdcard/JumpMaster/ for inspection.
+     * Overwrites the same file each time.
+     */
+    private fun saveDebugScreenshot(bitmap: Bitmap, result: ImageAnalyzer.AnalysisResult?) {
+        try {
+            // Use app-specific external dir (no permission needed)
+            val dir = context.getExternalFilesDir(Environment.DIRECTORY_PICTURES)
+                ?: File(context.filesDir, "debug_screenshots")
+            if (!dir.exists()) dir.mkdirs()
+
+            // Save raw screenshot
+            val file = File(dir, "debug_screenshot.png")
+            FileOutputStream(file).use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 90, out)
+            }
+            Log.i(TAG, "Debug screenshot saved: ${file.absolutePath}")
+
+            // Save annotated version if we have a result
+            if (result != null) {
+                val annotated = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                val canvas = Canvas(annotated)
+                val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    style = Paint.Style.STROKE
+                    strokeWidth = 3f
+                }
+
+                // Red circle at piece position
+                paint.color = AndroidColor.RED
+                canvas.drawCircle(result.pieceX.toFloat(), result.pieceY.toFloat(), 15f, paint)
+
+                // Blue circle at board position
+                paint.color = AndroidColor.BLUE
+                canvas.drawCircle(result.boardX.toFloat(), result.boardY.toFloat(), 15f, paint)
+
+                // Line between them
+                paint.color = AndroidColor.GREEN
+                paint.strokeWidth = 2f
+                canvas.drawLine(
+                    result.pieceX.toFloat(), result.pieceY.toFloat(),
+                    result.boardX.toFloat(), result.boardY.toFloat(),
+                    paint
+                )
+
+                val annotatedFile = File(dir, "debug_annotated.png")
+                FileOutputStream(annotatedFile).use { out ->
+                    annotated.compress(Bitmap.CompressFormat.PNG, 90, out)
+                }
+                Log.i(TAG, "Annotated screenshot saved: ${annotatedFile.absolutePath}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to save debug screenshot", e)
+        }
+    }
+
+    private fun vibrate() {
+        if (config.vibrate) {
+            vibrator.vibrate(VibrationEffect.createOneShot(50, VibrationEffect.DEFAULT_AMPLITUDE))
+        }
+    }
+
+    private fun setStatus(status: Status) {
+        handler.post { listener?.onStatusChanged(status) }
+    }
+
+    private fun updateFloatingStatus(status: String) {
+        val intent = Intent(context, FloatingWindowService::class.java).apply {
+            action = FloatingWindowService.ACTION_UPDATE_STATUS
+            putExtra(FloatingWindowService.EXTRA_STATUS, status)
+        }
+        try { context.startService(intent) } catch (e: Exception) {
+            Log.w(TAG, "Failed to update floating status", e)
+        }
+    }
+
+    private fun updateFloatingMetrics(count: Int, pressTimeMs: Long, distance: Float, etaMs: Long) {
+        val intent = Intent(context, FloatingWindowService::class.java).apply {
+            action = FloatingWindowService.ACTION_UPDATE_METRICS
+            putExtra(FloatingWindowService.EXTRA_COUNT, count)
+            putExtra(FloatingWindowService.EXTRA_PRESS_MS, pressTimeMs)
+            putExtra(FloatingWindowService.EXTRA_DISTANCE, distance)
+            putExtra(FloatingWindowService.EXTRA_ETA_MS, etaMs)
+        }
+        try { context.startService(intent) } catch (e: Exception) {
+            Log.w(TAG, "Failed to update floating metrics", e)
+        }
+    }
+
+    private fun addLog(message: String) {
+        val intent = Intent(context, FloatingWindowService::class.java).apply {
+            action = FloatingWindowService.ACTION_ADD_LOG
+            putExtra(FloatingWindowService.EXTRA_LOG, message)
+        }
+        try { context.startService(intent) } catch (e: Exception) {
+            Log.w(TAG, "Failed to add floating log", e)
+        }
+    }
+
+    private fun setFloatingVisible(visible: Boolean) {
+        val intent = Intent(context, FloatingWindowService::class.java).apply {
+            action = if (visible) FloatingWindowService.ACTION_TEMP_SHOW
+                     else FloatingWindowService.ACTION_TEMP_HIDE
+        }
+        try { context.startService(intent) } catch (_: Exception) {}
+    }
+
+    private fun createOriginalSwipePosition(width: Int, height: Int): Pair<Pair<Int, Int>, Pair<Int, Int>> {
+        val left = width / 2
+        val top = (1584f * (height / 1920f)).toInt()
+        val x1 = Random.nextInt(left - 200, left + 201).coerceIn(1, width - 1)
+        val y1 = Random.nextInt(top - 200, top + 201).coerceIn(1, height - 1)
+        val x2 = Random.nextInt(left - 200, left + 201).coerceIn(1, width - 1)
+        val y2 = Random.nextInt(top - 200, top + 201).coerceIn(1, height - 1)
+        return (x1 to y1) to (x2 to y2)
+    }
+
+    private fun resetRestPlan() {
+        jumpsSinceRest = 0
+        nextRestAfter = Random.nextInt(3, 10)
+        nextRestSeconds = Random.nextInt(5, 10)
+        updateFloatingMetrics(0, 0, 0f, 0)
+    }
+
+    private fun scheduleRestIfNeeded(onDone: () -> Unit): Boolean {
+        if (jumpsSinceRest < nextRestAfter) return false
+
+        val restMs = nextRestSeconds * 1000L
+        setStatus(Status.RESTING)
+        updateFloatingStatus("resting")
+        addLog("连续 $jumpsSinceRest 次，休息 ${nextRestSeconds}s")
+        updateFloatingMetrics(jumpCount, lastResult?.pressTimeMs ?: 0L, lastResult?.distance ?: 0f, restMs)
+
+        handler.postDelayed({
+            if (running && !paused) {
+                resetRestPlanAfterRest()
+                onDone()
+            }
+        }, restMs)
+        return true
+    }
+
+    private suspend fun restIfNeededSuspend(): Boolean {
+        if (jumpsSinceRest < nextRestAfter) return false
+
+        val restSeconds = nextRestSeconds
+        setStatus(Status.RESTING)
+        updateFloatingStatus("resting")
+        addLog("连续 $jumpsSinceRest 次，休息 ${restSeconds}s")
+        for (remaining in restSeconds downTo 1) {
+            if (!running || paused) return true
+            updateFloatingMetrics(jumpCount, lastResult?.pressTimeMs ?: 0L, lastResult?.distance ?: 0f, remaining * 1000L)
+            delay(1000)
+        }
+        resetRestPlanAfterRest()
+        return true
+    }
+
+    private fun resetRestPlanAfterRest() {
+        jumpsSinceRest = 0
+        nextRestAfter = Random.nextInt(30, 100)
+        nextRestSeconds = Random.nextInt(10, 60)
+        addLog("休息结束")
+    }
+}
